@@ -252,9 +252,9 @@ local function stopRecording()
             end
         end
     end
-    chooser:selectedRow(preselectedIndex)
-
     chooser:show()
+
+    chooser:selectedRow(preselectedIndex)
 
     -- Start transcription immediately (in parallel with chooser)
     hs.timer.doAfter(0.5, function()
