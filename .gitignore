@@ -1,0 +1,20 @@
+# Python
+/venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Transcripts (user data)
+/transcripts/*
+!/transcripts/.gitkeep
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Hammerspoon
+/.claude/
+.DS_Store

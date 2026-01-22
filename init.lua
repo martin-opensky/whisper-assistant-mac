@@ -1,0 +1,498 @@
+-- Hammerspoon Voice Transcription Tool
+-- Uses faster-whisper and ffmpeg for voice transcription
+
+-- Global state
+local isRecording = false
+local isProcessing = false
+local recordingTask = nil
+local menuBarItem = nil
+local recordingAlert = nil
+local processingAlert = nil
+local currentAudioFile = nil
+local transcriptionTask = nil
+local selectedPostProcessing = nil
+local scriptDir = debug.getinfo(1, "S").source:match("@(.*/)")
+
+-- Cleanup function to terminate any existing tasks and reset state
+local function cleanup()
+    if recordingTask then recordingTask:terminate() end
+    if transcriptionTask then transcriptionTask:terminate() end
+    if menuBarItem then menuBarItem:delete() end
+    if recordingAlert then hs.alert.closeSpecific(recordingAlert) end
+    if processingAlert then hs.alert.closeSpecific(processingAlert) end
+    -- Reset state
+    isRecording = false
+    isProcessing = false
+    recordingTask = nil
+    transcriptionTask = nil
+    menuBarItem = nil
+    recordingAlert = nil
+    processingAlert = nil
+    currentAudioFile = nil
+end
+
+-- Helper function to show alert on focused screen
+local function showAlert(message, duration)
+    local focusedScreen = hs.screen.mainScreen()
+    return hs.alert.show(message, duration or 1.5, focusedScreen)
+end
+
+-- Helper function to load settings
+local function loadSettings()
+    local settingsPath = scriptDir .. "settings.json"
+    local file = io.open(settingsPath, "r")
+    if not file then
+        showAlert("Error: settings.json not found")
+        return nil
+    end
+    local content = file:read("*all")
+    file:close()
+    local settings = hs.json.decode(content)
+    return settings
+end
+
+-- Helper function to get available post-processing options
+local function getPostProcessingChoices()
+    local instructionsDir = scriptDir .. "instructions/"
+    local choices = {{
+        text = "None",
+        subText = "No post-processing - paste raw transcription",
+        value = nil  -- Special value for no processing
+    }}
+
+    -- Dynamically list all .md files from instructions/
+    local handle = io.popen("ls " .. instructionsDir .. "*.md 2>/dev/null")
+    if handle then
+        for filepath in handle:lines() do
+            local filename = filepath:match("([^/]+)%.md$")
+            if filename then
+                table.insert(choices, {
+                    text = filename,
+                    subText = "Format using " .. filename .. " instructions",
+                    value = filename
+                })
+            end
+        end
+        handle:close()
+    end
+
+    return choices
+end
+
+-- Helper function to save post-processing preference
+local function savePostProcessingPreference(selection)
+    local settingsPath = scriptDir .. "settings.json"
+    local settings = loadSettings()
+    if not settings then
+        print("Error: Could not load settings for saving preference")
+        return
+    end
+
+    if selection then
+        settings.postProcessing = selection
+    else
+        settings.postProcessing = hs.json.null  -- Use JSON null for "None"
+    end
+
+    -- Write back to settings.json
+    local file = io.open(settingsPath, "w")
+    if file then
+        local success, encoded = pcall(hs.json.encode, settings, true)
+        if success then
+            file:write(encoded)
+            print("Saved postProcessing preference: " .. (selection or "None"))
+        else
+            print("Error encoding settings: " .. tostring(encoded))
+        end
+        file:close()
+    else
+        print("Error: Could not open settings.json for writing")
+    end
+end
+
+-- Helper function to get timestamp
+local function getTimestamp()
+    return os.date("%Y-%m-%d_%H-%M-%S")
+end
+
+-- Helper function to save transcript
+local function saveTranscript(originalText, processedText, processingType)
+    local transcriptDir = scriptDir .. "transcripts/"
+    os.execute("mkdir -p " .. transcriptDir)
+    local filename = transcriptDir .. getTimestamp() .. ".md"
+    local file = io.open(filename, "w")
+    if file then
+        file:write("# Transcript " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n\n")
+
+        -- Always save original transcription first
+        file:write("## Original Transcription\n\n")
+        file:write(originalText .. "\n\n")
+
+        -- If post-processing was used, append processed version
+        if processedText and processingType then
+            file:write("---\n\n")
+            file:write("## Post-processed (" .. processingType .. ")\n\n")
+            file:write(processedText .. "\n")
+        end
+
+        file:close()
+        print("Transcript saved to: " .. filename)
+    end
+end
+
+-- Start recording
+local function startRecording()
+    -- Load settings
+    local settings = loadSettings()
+    if not settings then
+        return
+    end
+
+    local audioFile = os.tmpname() .. ".wav"
+    local audioDevice = settings.audioDevice or ":1"  -- Default to built-in microphone
+
+    -- Create menu bar indicator with styled red circle
+    if not menuBarItem then
+        menuBarItem = hs.menubar.new()
+    end
+    menuBarItem:setTitle(hs.styledtext.new("●", {
+        color = {red = 1.0, green = 0.0, blue = 0.0},
+        font = {name = ".AppleSystemUIFont", size = 18}
+    }))
+    menuBarItem:setTooltip("Recording audio...")
+
+    -- Start ffmpeg recording with configured audio device
+    local ffmpegCmd = string.format(
+        '/opt/homebrew/bin/ffmpeg -f avfoundation -i "%s" -ar 16000 -ac 1 -y "%s" 2>&1',
+        audioDevice,
+        audioFile
+    )
+
+    recordingTask = hs.task.new(
+        "/bin/bash",
+        function(exitCode, stdOut, stdErr)
+            print("FFmpeg exit code: " .. exitCode)
+            if exitCode ~= 0 then
+                print("FFmpeg output: " .. stdOut)
+                print("FFmpeg error: " .. stdErr)
+            end
+        end,
+        {"-c", ffmpegCmd}
+    )
+
+    recordingTask:start()
+    isRecording = true
+
+    -- Store audio file path for later use
+    currentAudioFile = audioFile
+
+    -- Show persistent recording alert
+    recordingAlert = showAlert("🎤 Recording...", "infinite")
+end
+
+-- Stop recording and transcribe
+local function stopRecording()
+    if not recordingTask then
+        return
+    end
+
+    -- Stop recording
+    recordingTask:terminate()
+    local audioFile = currentAudioFile
+
+    -- Close persistent recording alert
+    if recordingAlert then
+        hs.alert.closeSpecific(recordingAlert)
+        recordingAlert = nil
+    end
+
+    -- Remove menu bar indicator
+    if menuBarItem then
+        menuBarItem:delete()
+        menuBarItem = nil
+    end
+
+    isRecording = false
+    isProcessing = true
+
+    -- Load settings and pre-set selectedPostProcessing to saved preference
+    local settings = loadSettings()
+    if not settings then
+        return
+    end
+    selectedPostProcessing = settings.postProcessing
+
+    -- Show persistent processing alert
+    processingAlert = showAlert("⏸️ Transcribing...", "infinite")
+
+    -- Show chooser immediately (in parallel with transcription)
+    -- Chooser stays open during entire transcription - user can change selection anytime
+    -- When transcription completes, whatever is selected will be used automatically
+    local choices = getPostProcessingChoices()
+    local chooser = hs.chooser.new(function(choice)
+        if choice then
+            -- User manually selected an option - update preference
+            savePostProcessingPreference(choice.value)
+            print("Post-processing option changed to: " .. (choice.value or "None"))
+        end
+    end)
+    chooser:choices(choices)
+    chooser:rows(math.min(#choices, 5))  -- Max 5 visible rows
+    chooser:searchSubText(true)  -- Allow searching by subtext
+
+    -- Pre-select last used option
+    local preselectedIndex = 1  -- Default to "None"
+    if settings.postProcessing then
+        print("Looking for saved preference: " .. settings.postProcessing)
+        for i, choice in ipairs(choices) do
+            if choice.value == settings.postProcessing then
+                preselectedIndex = i
+                print("Pre-selecting row " .. i .. ": " .. choice.text)
+                break
+            end
+        end
+    end
+    chooser:selectedRow(preselectedIndex)
+
+    chooser:show()
+
+    -- Start transcription immediately (in parallel with chooser)
+    hs.timer.doAfter(0.5, function()
+        -- Check if audio file exists and has content
+        local file = io.open(audioFile, "r")
+        if not file then
+            chooser:hide()
+            if processingAlert then
+                hs.alert.closeSpecific(processingAlert)
+                processingAlert = nil
+            end
+            showAlert("❌ Audio file not created")
+            print("Error: Audio file not found at " .. audioFile)
+            recordingTask = nil
+            isProcessing = false
+            return
+        end
+
+        local fileSize = file:seek("end")
+        file:close()
+
+        if fileSize < 1000 then  -- Less than 1KB is probably empty/corrupted
+            chooser:hide()
+            if processingAlert then
+                hs.alert.closeSpecific(processingAlert)
+                processingAlert = nil
+            end
+            showAlert("❌ Audio file too small")
+            print("Error: Audio file size is only " .. fileSize .. " bytes")
+            os.remove(audioFile)
+            recordingTask = nil
+            isProcessing = false
+            return
+        end
+
+        print("Audio file created successfully: " .. fileSize .. " bytes")
+
+        -- Load settings
+        local settings = loadSettings()
+        if not settings then
+            chooser:hide()
+            if processingAlert then
+                hs.alert.closeSpecific(processingAlert)
+                processingAlert = nil
+            end
+            os.remove(audioFile)
+            recordingTask = nil
+            isProcessing = false
+            return
+        end
+
+        -- Run transcription asynchronously using hs.task
+        local pythonScript = scriptDir .. "transcribe.py"
+        local model = settings.model or "small"
+        local language = settings.language or "en"
+        local pythonPath = scriptDir .. "venv/bin/python"
+
+        print("Running transcription command")
+
+        transcriptionTask = hs.task.new(
+            pythonPath,
+            function(exitCode, stdOut, stdErr)
+                print("Transcription exit code: " .. exitCode)
+
+                -- Read currently selected option from chooser and close it
+                local selectedRow = chooser:selectedRow()
+                if selectedRow and selectedRow > 0 and selectedRow <= #choices then
+                    local selectedChoice = choices[selectedRow]
+                    selectedPostProcessing = selectedChoice.value
+                    savePostProcessingPreference(selectedChoice.value)
+                    print("Using selected post-processing: " .. (selectedChoice.value or "None"))
+                end
+                chooser:hide()
+
+                -- Close persistent processing alert
+                if processingAlert then
+                    hs.alert.closeSpecific(processingAlert)
+                    processingAlert = nil
+                end
+
+                -- Clean up audio file
+                os.remove(audioFile)
+
+                if exitCode == 0 then
+                    local text = stdOut:gsub("^%s*(.-)%s*$", "%1") -- trim whitespace
+                    if text ~= "" then
+                        -- Check if post-processing is enabled (using selectedPostProcessing from chooser)
+                        if selectedPostProcessing then
+                            -- Show post-processing feedback
+                            if processingAlert then
+                                hs.alert.closeSpecific(processingAlert)
+                            end
+                            processingAlert = showAlert("⚙️ Processing: " .. selectedPostProcessing, "infinite")
+
+                            -- Run post-processing
+                            local postprocessScript = scriptDir .. "postprocess.py"
+                            local instructionFile = scriptDir .. "instructions/" .. selectedPostProcessing .. ".md"
+
+                            print("Running post-processing with: " .. selectedPostProcessing)
+
+                            local postprocessTask = hs.task.new(
+                                pythonPath,
+                                function(ppExitCode, ppStdOut, ppStdErr)
+                                    -- Close persistent processing alert
+                                    if processingAlert then
+                                        hs.alert.closeSpecific(processingAlert)
+                                        processingAlert = nil
+                                    end
+
+                                    local finalText = text  -- Default to original
+                                    local processedText = nil
+
+                                    if ppExitCode == 0 then
+                                        processedText = ppStdOut:gsub("^%s*(.-)%s*$", "%1")
+                                        if processedText ~= "" then
+                                            finalText = processedText
+                                            print("Post-processing successful: " .. #finalText .. " characters")
+                                        else
+                                            print("Warning: Post-processing returned empty, using original")
+                                            processedText = nil  -- Clear if empty
+                                        end
+                                    else
+                                        print("Post-processing error: " .. ppStdErr)
+                                        print("Using original transcription")
+                                        processedText = nil  -- Clear on error
+                                    end
+
+                                    -- Save transcript with both original and processed versions
+                                    saveTranscript(text, processedText, selectedPostProcessing)
+
+                                    -- Copy to clipboard
+                                    hs.pasteboard.setContents(finalText)
+
+                                    -- Paste text at cursor
+                                    hs.eventtap.keyStrokes(finalText)
+                                    showAlert("✓ Transcribed & Processed")
+
+                                    recordingTask = nil
+                                    currentAudioFile = nil
+                                    transcriptionTask = nil
+                                    isProcessing = false
+                                end,
+                                {postprocessScript, text, instructionFile}
+                            )
+
+                            postprocessTask:start()
+                        else
+                            -- No post-processing, use original transcription
+                            -- Close persistent processing alert
+                            if processingAlert then
+                                hs.alert.closeSpecific(processingAlert)
+                                processingAlert = nil
+                            end
+
+                            -- Save transcript (original only, no post-processing)
+                            saveTranscript(text, nil, nil)
+
+                            -- Copy to clipboard
+                            hs.pasteboard.setContents(text)
+
+                            -- Paste text at cursor
+                            hs.eventtap.keyStrokes(text)
+                            showAlert("✓ Transcribed & Copied")
+                            print("Transcription successful: " .. #text .. " characters")
+
+                            recordingTask = nil
+                            currentAudioFile = nil
+                            transcriptionTask = nil
+                            isProcessing = false
+                        end
+                    else
+                        -- Close persistent processing alert
+                        if processingAlert then
+                            hs.alert.closeSpecific(processingAlert)
+                            processingAlert = nil
+                        end
+
+                        showAlert("⚠️ No speech detected")
+                        print("Warning: Transcription returned empty text")
+
+                        recordingTask = nil
+                        currentAudioFile = nil
+                        transcriptionTask = nil
+                        isProcessing = false
+                    end
+                else
+                    -- Close persistent processing alert
+                    if processingAlert then
+                        hs.alert.closeSpecific(processingAlert)
+                        processingAlert = nil
+                    end
+
+                    showAlert("❌ Transcription failed")
+                    print("Transcription error: " .. stdErr)
+
+                    recordingTask = nil
+                    currentAudioFile = nil
+                    transcriptionTask = nil
+                    isProcessing = false
+                end
+            end,
+            {pythonScript, audioFile, model, language}
+        )
+
+        transcriptionTask:start()
+    end)
+end
+
+-- Toggle recording
+local function toggleRecording()
+    if isProcessing then
+        showAlert("⏳ Still processing...")
+        return
+    end
+    if isRecording then
+        stopRecording()
+    else
+        startRecording()
+    end
+end
+
+-- Setup hotkey
+local function setupHotkey()
+    local settings = loadSettings()
+    if not settings then
+        return
+    end
+
+    local mods = settings.hotkey.modifiers or {"cmd"}
+    local key = settings.hotkey.key or "m"
+
+    hs.hotkey.bind(mods, key, toggleRecording)
+
+    showAlert("Voice transcription loaded: " .. table.concat(mods, "+") .. "+" .. key)
+end
+
+-- Clean up any existing state from previous loads
+cleanup()
+
+-- Initialize
+setupHotkey()
