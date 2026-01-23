@@ -2,7 +2,6 @@
   "audioDevice" : ":1",
   "language" : "en",
   "model" : "small",
-  "postProcessing" : "claudecode",
   "hotkey" : {
     "key" : "m",
     "modifiers" : [

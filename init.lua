@@ -115,29 +115,89 @@ local function getTimestamp()
     return os.date("%Y-%m-%d_%H-%M-%S")
 end
 
+-- Helper function to get date string for directory
+local function getDateDir()
+    return os.date("%Y-%m-%d")
+end
+
+-- Helper function to get time string for subdirectory
+local function getTimeDir()
+    return os.date("%H-%M-%S")
+end
+
+-- Helper function to clean up old transcripts (older than 7 days)
+local function cleanupOldTranscripts()
+    local transcriptDir = scriptDir .. "transcripts/"
+    local maxAgeDays = 7
+
+    -- Use hs.task for non-blocking cleanup
+    hs.task.new(
+        "/bin/bash",
+        function(exitCode, stdOut, stdErr)
+            if exitCode == 0 then
+                local deletedCount = tonumber(stdOut:match("(%d+)")) or 0
+                if deletedCount > 0 then
+                    print("Cleanup: Removed " .. deletedCount .. " old transcript(s)")
+                end
+            else
+                print("Cleanup error: " .. stdErr)
+            end
+        end,
+        {"-c", string.format([[
+            count=0
+            transcript_dir="%s"
+            max_age_days=%d
+
+            # Find and delete transcript directories older than max_age_days
+            for date_dir in "$transcript_dir"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
+                [ -d "$date_dir" ] || continue
+
+                for time_dir in "$date_dir"/[0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
+                    [ -d "$time_dir" ] || continue
+
+                    # Check if directory is older than max_age_days
+                    if [ $(find "$time_dir" -maxdepth 0 -mtime +$max_age_days 2>/dev/null | wc -l) -gt 0 ]; then
+                        rm -rf "$time_dir"
+                        ((count++))
+                    fi
+                done
+
+                # Remove date directory if empty
+                rmdir "$date_dir" 2>/dev/null
+            done
+
+            echo "$count"
+        ]], transcriptDir, maxAgeDays)}
+    ):start()
+end
+
 -- Helper function to save transcript
 local function saveTranscript(originalText, processedText, processingType)
-    local transcriptDir = scriptDir .. "transcripts/"
+    local baseTranscriptDir = scriptDir .. "transcripts/"
+    local dateDir = getDateDir()
+    local timeDir = getTimeDir()
+    local transcriptDir = baseTranscriptDir .. dateDir .. "/" .. timeDir .. "/"
+
+    -- Create nested directory structure
     os.execute("mkdir -p " .. transcriptDir)
-    local filename = transcriptDir .. getTimestamp() .. ".md"
-    local file = io.open(filename, "w")
-    if file then
-        file:write("# Transcript " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n\n")
 
-        -- Always save original transcription first
-        file:write("## Original Transcription\n\n")
-        file:write(originalText .. "\n\n")
-
-        -- If post-processing was used, append processed version
-        if processedText and processingType then
-            file:write("---\n\n")
-            file:write("## Post-processed (" .. processingType .. ")\n\n")
-            file:write(processedText .. "\n")
-        end
-
-        file:close()
-        print("Transcript saved to: " .. filename)
+    -- Save original transcript (content only)
+    local originalFile = io.open(transcriptDir .. "transcript.md", "w")
+    if originalFile then
+        originalFile:write(originalText)
+        originalFile:close()
     end
+
+    -- Save post-processed transcript to separate file if exists
+    if processedText and processingType then
+        local processedFile = io.open(transcriptDir .. processingType .. ".md", "w")
+        if processedFile then
+            processedFile:write(processedText)
+            processedFile:close()
+        end
+    end
+
+    print("Transcript saved to: " .. transcriptDir)
 end
 
 -- Start recording
@@ -496,3 +556,6 @@ cleanup()
 
 -- Initialize
 setupHotkey()
+
+-- Run cleanup on startup to remove old transcripts
+cleanupOldTranscripts()
