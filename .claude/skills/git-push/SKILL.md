@@ -1,5 +1,5 @@
 ---
-name: ship
+name: git-push
 description: Stage, commit, push changes and create PR if on feature branch
 disable-model-invocation: true
 allowed-tools: Bash(git:*, gh:*), Read, Grep, Glob
