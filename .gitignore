@@ -15,6 +15,6 @@ __pycache__/
 .AppleDouble
 .LSOverride
 
-# Hammerspoon
-/.claude/
+# Claude Code (keep skills, ignore local settings)
+/.claude/settings.local.json
 .DS_Store
