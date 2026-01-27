@@ -13,6 +13,10 @@ local transcriptionTask = nil
 local selectedPostProcessing = nil
 local scriptDir = debug.getinfo(1, "S").source:match("@(.*/)")
 
+-- Audio fade state
+local savedVolume = nil
+local fadeTimer = nil
+
 -- Cleanup function to terminate any existing tasks and reset state
 local function cleanup()
     if recordingTask then recordingTask:terminate() end
@@ -20,6 +24,16 @@ local function cleanup()
     if menuBarItem then menuBarItem:delete() end
     if recordingAlert then hs.alert.closeSpecific(recordingAlert) end
     if processingAlert then hs.alert.closeSpecific(processingAlert) end
+    -- Stop any active fade timer and restore volume
+    if fadeTimer then
+        fadeTimer:stop()
+        fadeTimer = nil
+    end
+    if savedVolume then
+        local device = hs.audiodevice.defaultOutputDevice()
+        if device then device:setVolume(savedVolume) end
+        savedVolume = nil
+    end
     -- Reset state
     isRecording = false
     isProcessing = false
@@ -35,6 +49,53 @@ end
 local function showAlert(message, duration)
     local focusedScreen = hs.screen.mainScreen()
     return hs.alert.show(message, duration or 1.5, focusedScreen)
+end
+
+-- Helper function to fade audio volume linearly
+-- targetVolume: 0-100, duration: seconds, callback: optional function to call when done
+local function fadeVolume(targetVolume, duration, callback)
+    -- Stop any existing fade
+    if fadeTimer then
+        fadeTimer:stop()
+        fadeTimer = nil
+    end
+
+    local device = hs.audiodevice.defaultOutputDevice()
+    if not device then
+        print("Warning: No default audio output device found")
+        if callback then callback() end
+        return
+    end
+
+    local currentVolume = device:volume()
+    if currentVolume == nil then
+        print("Warning: Could not get current volume")
+        if callback then callback() end
+        return
+    end
+
+    local steps = 10  -- Number of steps for the fade
+    local interval = duration / steps  -- Time between each step (0.05s for 0.5s duration)
+    local volumeStep = (targetVolume - currentVolume) / steps
+    local currentStep = 0
+
+    fadeTimer = hs.timer.doEvery(interval, function()
+        currentStep = currentStep + 1
+        local newVolume = currentVolume + (volumeStep * currentStep)
+
+        -- Clamp volume to valid range
+        newVolume = math.max(0, math.min(100, newVolume))
+
+        device:setVolume(newVolume)
+
+        if currentStep >= steps then
+            fadeTimer:stop()
+            fadeTimer = nil
+            -- Ensure we hit the exact target
+            device:setVolume(targetVolume)
+            if callback then callback() end
+        end
+    end)
 end
 
 -- Helper function to load settings
@@ -211,6 +272,15 @@ local function startRecording()
     local audioFile = os.tmpname() .. ".wav"
     local audioDevice = settings.audioDevice or ":1"  -- Default to built-in microphone
 
+    -- Save current volume and fade out to 0
+    local device = hs.audiodevice.defaultOutputDevice()
+    if device then
+        savedVolume = device:volume()
+        if savedVolume and savedVolume > 0 then
+            fadeVolume(0, 0.5)
+        end
+    end
+
     -- Create menu bar indicator with styled red circle
     if not menuBarItem then
         menuBarItem = hs.menubar.new()
@@ -259,6 +329,13 @@ local function stopRecording()
     -- Stop recording
     recordingTask:terminate()
     local audioFile = currentAudioFile
+
+    -- Fade volume back in to saved level
+    if savedVolume and savedVolume > 0 then
+        fadeVolume(savedVolume, 0.5, function()
+            savedVolume = nil
+        end)
+    end
 
     -- Close persistent recording alert
     if recordingAlert then
