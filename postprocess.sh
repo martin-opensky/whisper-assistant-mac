@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# Post-process transcription using Claude Haiku
-# Faster shell script version - eliminates Python startup overhead
+# Post-process transcription using Ollama (local, fast)
+# Falls back to Claude CLI if Ollama is unavailable
 #
 # Usage: postprocess.sh "<transcription_text>" <instruction_file>
 #
@@ -11,52 +11,55 @@ set -e
 TEXT="$1"
 INSTRUCTION_FILE="$2"
 
-# Find claude CLI
-CLAUDE_PATH="$HOME/.local/bin/claude"
-if [ ! -x "$CLAUDE_PATH" ]; then
-    CLAUDE_PATH=$(which claude 2>/dev/null || echo "")
+# Configuration
+OLLAMA_MODEL="qwen2.5:1.5b"
+OLLAMA_URL="http://localhost:11434/api/chat"
+TIMEOUT=30
+
+# Check if Ollama is running
+if curl -s --connect-timeout 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
+    # Use Ollama (fast, local)
+
+    # Read instructions and extract just the core formatting rules
+    # Use a simplified system prompt for speed
+    SYSTEM_PROMPT="You are a text formatter for voice transcriptions. Convert the input into a structured task format.
+
+Rules:
+- Output ONLY the formatted result, no explanations
+- Never ask questions or request clarification
+- Extract the actionable task from the voice input
+
+Output format:
+## Task
+[Clear, concise task description]
+
+## Requirements
+- [Key requirement 1]
+- [Key requirement 2]
+
+If the input is casual/non-technical, just clean it up and return it directly."
+
+    # Call Ollama API
+    RESULT=$(curl -s --max-time "$TIMEOUT" "$OLLAMA_URL" -d "$(jq -n \
+        --arg model "$OLLAMA_MODEL" \
+        --arg system "$SYSTEM_PROMPT" \
+        --arg text "$TEXT" \
+        '{
+            model: $model,
+            messages: [
+                {role: "system", content: $system},
+                {role: "user", content: $text}
+            ],
+            stream: false
+        }')" 2>/dev/null | jq -r '.message.content // empty')
+
+    if [ -n "$RESULT" ]; then
+        echo "$RESULT"
+        exit 0
+    fi
+
+    echo "Warning: Ollama returned empty, falling back to original" >&2
 fi
 
-if [ -z "$CLAUDE_PATH" ] || [ ! -x "$CLAUDE_PATH" ]; then
-    echo "Error: Claude CLI not found" >&2
-    echo "$TEXT"
-    exit 0
-fi
-
-# Check instruction file exists
-if [ ! -f "$INSTRUCTION_FILE" ]; then
-    echo "Error: Instruction file not found: $INSTRUCTION_FILE" >&2
-    echo "$TEXT"
-    exit 0
-fi
-
-# Read instructions
-INSTRUCTIONS=$(cat "$INSTRUCTION_FILE")
-
-# Build full prompt
-FULL_PROMPT="${INSTRUCTIONS}
-
-## Transcription to format:
-
-${TEXT}"
-
-# Call Claude CLI with text output (no JSON parsing needed)
-# --output-format text returns raw text directly
-# --model haiku is the fastest model
-# --no-session-persistence avoids session overhead
-RESULT=$("$CLAUDE_PATH" -p "$FULL_PROMPT" \
-    --model haiku \
-    --output-format text \
-    --no-session-persistence \
-    2>/dev/null) || {
-    echo "Error: Claude CLI failed" >&2
-    echo "$TEXT"
-    exit 0
-}
-
-# Return result (or original text if empty)
-if [ -n "$RESULT" ]; then
-    echo "$RESULT"
-else
-    echo "$TEXT"
-fi
+# Fallback: return original text if Ollama unavailable or failed
+echo "$TEXT"
