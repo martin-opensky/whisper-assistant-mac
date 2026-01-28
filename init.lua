@@ -11,6 +11,8 @@ local processingAlert = nil
 local currentAudioFile = nil
 local transcriptionTask = nil
 local transcriptionTimeout = nil
+local transcriptionProgressTimer = nil
+local transcriptionStartTime = nil
 local selectedPostProcessing = nil
 local scriptDir = debug.getinfo(1, "S").source:match("@(.*/)")
 
@@ -452,10 +454,30 @@ local function stopRecording()
 
         print("Running whisper.cpp transcription with model: " .. model)
 
+        -- Track start time for elapsed display
+        transcriptionStartTime = os.time()
+
+        -- Update alert with elapsed time every second
+        transcriptionProgressTimer = hs.timer.doEvery(1, function()
+            if transcriptionStartTime and processingAlert then
+                local elapsed = os.time() - transcriptionStartTime
+                hs.alert.closeSpecific(processingAlert)
+                processingAlert = showAlert(string.format("⏸️ Transcribing... %ds", elapsed), "infinite")
+            end
+        end)
+
         transcriptionTask = hs.task.new(
             "/bin/bash",
             function(exitCode, stdOut, stdErr)
-                print("Transcription exit code: " .. exitCode)
+                local elapsed = transcriptionStartTime and (os.time() - transcriptionStartTime) or 0
+                print(string.format("Transcription completed in %ds, exit code: %d", elapsed, exitCode))
+
+                -- Cancel progress timer
+                if transcriptionProgressTimer then
+                    transcriptionProgressTimer:stop()
+                    transcriptionProgressTimer = nil
+                end
+                transcriptionStartTime = nil
 
                 -- Cancel timeout timer since transcription completed
                 if transcriptionTimeout then
@@ -591,8 +613,19 @@ local function stopRecording()
                         processingAlert = nil
                     end
 
-                    showAlert("❌ Transcription failed")
-                    print("Transcription error: " .. stdErr)
+                    -- Parse error from stderr for user-friendly message
+                    local errorMsg = "Transcription failed"
+                    if stdErr:match("Model not found") then
+                        errorMsg = "Model not found - run: ollama pull llama3.2:3b"
+                    elseif stdErr:match("Audio file too small") then
+                        errorMsg = "Recording too short"
+                    elseif stdErr:match("empty result") then
+                        errorMsg = "No speech detected"
+                    elseif stdErr:match("whisper%-cli") then
+                        errorMsg = "Whisper error - check logs"
+                    end
+                    showAlert("❌ " .. errorMsg, 3)
+                    print("Transcription error (stderr): " .. stdErr)
 
                     recordingTask = nil
                     currentAudioFile = nil
@@ -608,8 +641,15 @@ local function stopRecording()
         -- Add timeout to prevent infinite hangs (90 seconds max for longer recordings)
         transcriptionTimeout = hs.timer.doAfter(90, function()
             if transcriptionTask and transcriptionTask:isRunning() then
-                print("Transcription timeout - terminating task")
+                print("Transcription timeout after 90 seconds - terminating task")
                 transcriptionTask:terminate()
+
+                -- Cancel progress timer
+                if transcriptionProgressTimer then
+                    transcriptionProgressTimer:stop()
+                    transcriptionProgressTimer = nil
+                end
+                transcriptionStartTime = nil
 
                 -- Close alerts and chooser
                 if processingAlert then
