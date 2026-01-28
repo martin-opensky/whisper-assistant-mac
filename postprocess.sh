@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Post-process transcription using Ollama (local, fast)
-# Falls back to Claude CLI if Ollama is unavailable
+# Uses llama3.2:3b for good quality/speed balance
 #
 # Usage: postprocess.sh "<transcription_text>" <instruction_file>
 #
@@ -11,8 +11,8 @@ set -e
 TEXT="$1"
 INSTRUCTION_FILE="$2"
 
-# Configuration
-OLLAMA_MODEL="qwen2.5:1.5b"
+# Configuration - llama3.2:3b offers best quality/speed balance
+OLLAMA_MODEL="llama3.2:3b"
 OLLAMA_URL="http://localhost:11434/api/chat"
 TIMEOUT=30
 
@@ -20,24 +20,27 @@ TIMEOUT=30
 if curl -s --connect-timeout 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
     # Use Ollama (fast, local)
 
-    # Read instructions and extract just the core formatting rules
-    # Use a simplified system prompt for speed
-    SYSTEM_PROMPT="You are a text formatter for voice transcriptions. Convert the input into a structured task format.
+    SYSTEM_PROMPT="Convert voice transcriptions into this EXACT format:
 
-Rules:
-- Output ONLY the formatted result, no explanations
-- Never ask questions or request clarification
-- Extract the actionable task from the voice input
-
-Output format:
 ## Task
-[Clear, concise task description]
+[One clear sentence describing what needs to be done]
+
+## Problem
+[What is currently broken or wrong]
+
+## Goal
+[What should happen when this is fixed]
 
 ## Requirements
-- [Key requirement 1]
-- [Key requirement 2]
+- [Specific step or requirement 1]
+- [Specific step or requirement 2]
+- [Specific step or requirement 3]
 
-If the input is casual/non-technical, just clean it up and return it directly."
+Rules:
+- Output ONLY the formatted text above, nothing else
+- No explanations, no questions, no preamble
+- Keep each section concise (1-2 sentences max)
+- If input is casual/non-technical, just clean it up and return it directly without the format"
 
     # Call Ollama API
     RESULT=$(curl -s --max-time "$TIMEOUT" "$OLLAMA_URL" -d "$(jq -n \
