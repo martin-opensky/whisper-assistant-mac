@@ -1,3 +1,6 @@
+# Whisper models (download separately)
+/models/*.bin
+
 # Python
 /venv
 __pycache__/

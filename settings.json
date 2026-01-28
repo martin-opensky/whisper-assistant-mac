@@ -1,8 +1,7 @@
 {
   "audioDevice" : ":1",
-  "postProcessing" : "claudecode",
   "language" : "en",
-  "model" : "small",
+  "model" : "base.en",
   "hotkey" : {
     "key" : "m",
     "modifiers" : [

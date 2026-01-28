@@ -1,5 +1,5 @@
 -- Hammerspoon Voice Transcription Tool
--- Uses faster-whisper and ffmpeg for voice transcription
+-- Uses whisper.cpp with Metal GPU acceleration and ffmpeg for voice transcription
 
 -- Global state
 local isRecording = false
@@ -10,6 +10,7 @@ local recordingAlert = nil
 local processingAlert = nil
 local currentAudioFile = nil
 local transcriptionTask = nil
+local transcriptionTimeout = nil
 local selectedPostProcessing = nil
 local scriptDir = debug.getinfo(1, "S").source:match("@(.*/)")
 
@@ -444,17 +445,23 @@ local function stopRecording()
         end
 
         -- Run transcription asynchronously using hs.task
-        local pythonScript = scriptDir .. "transcribe.py"
-        local model = settings.model or "small"
+        -- Using whisper.cpp with Metal GPU acceleration for fast transcription
+        local transcribeScript = scriptDir .. "transcribe.sh"
+        local model = settings.model or "base.en"
         local language = settings.language or "en"
-        local pythonPath = scriptDir .. "venv/bin/python"
 
-        print("Running transcription command")
+        print("Running whisper.cpp transcription with model: " .. model)
 
         transcriptionTask = hs.task.new(
-            pythonPath,
+            "/bin/bash",
             function(exitCode, stdOut, stdErr)
                 print("Transcription exit code: " .. exitCode)
+
+                -- Cancel timeout timer since transcription completed
+                if transcriptionTimeout then
+                    transcriptionTimeout:stop()
+                    transcriptionTimeout = nil
+                end
 
                 -- Read currently selected option from chooser and close it
                 local selectedRow = chooser:selectedRow()
@@ -486,14 +493,14 @@ local function stopRecording()
                             end
                             processingAlert = showAlert("⚙️ Processing: " .. selectedPostProcessing, "infinite")
 
-                            -- Run post-processing
-                            local postprocessScript = scriptDir .. "postprocess.py"
+                            -- Run post-processing using faster shell script
+                            local postprocessScript = scriptDir .. "postprocess.sh"
                             local instructionFile = scriptDir .. "instructions/" .. selectedPostProcessing .. ".md"
 
                             print("Running post-processing with: " .. selectedPostProcessing)
 
                             local postprocessTask = hs.task.new(
-                                pythonPath,
+                                "/bin/bash",
                                 function(ppExitCode, ppStdOut, ppStdErr)
                                     -- Close persistent processing alert
                                     if processingAlert then
@@ -593,10 +600,36 @@ local function stopRecording()
                     isProcessing = false
                 end
             end,
-            {pythonScript, audioFile, model, language}
+            {transcribeScript, audioFile, model, language}
         )
 
         transcriptionTask:start()
+
+        -- Add timeout to prevent infinite hangs (90 seconds max for longer recordings)
+        transcriptionTimeout = hs.timer.doAfter(90, function()
+            if transcriptionTask and transcriptionTask:isRunning() then
+                print("Transcription timeout - terminating task")
+                transcriptionTask:terminate()
+
+                -- Close alerts and chooser
+                if processingAlert then
+                    hs.alert.closeSpecific(processingAlert)
+                    processingAlert = nil
+                end
+                chooser:hide()
+
+                -- Clean up
+                if audioFile and hs.fs.attributes(audioFile) then
+                    os.remove(audioFile)
+                end
+
+                showAlert("❌ Transcription timed out", 3)
+                recordingTask = nil
+                currentAudioFile = nil
+                transcriptionTask = nil
+                isProcessing = false
+            end
+        end)
     end)
 end
 
