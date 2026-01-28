@@ -1,7 +1,6 @@
 #!/bin/bash
 #
-# Post-process transcription using Ollama (local, fast)
-# Uses the instruction file for formatting rules
+# Post-process transcription using Claude Haiku via Claude Code CLI
 #
 # Usage: postprocess.sh "<transcription_text>" <instruction_file>
 #
@@ -11,50 +10,52 @@ set -e
 TEXT="$1"
 INSTRUCTION_FILE="$2"
 
-# Configuration
-OLLAMA_MODEL="llama3.2:3b"
-OLLAMA_URL="http://localhost:11434/api/chat"
-TIMEOUT=30
-
-# Check if Ollama is running
-if curl -s --connect-timeout 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
-
-    # Read instructions from file if provided
-    if [ -f "$INSTRUCTION_FILE" ]; then
-        SYSTEM_PROMPT=$(cat "$INSTRUCTION_FILE")
-    else
-        # Fallback to basic prompt
-        SYSTEM_PROMPT="Clean up this voice transcription. Do not add anything. Do not respond conversationally. Just output the cleaned text."
-    fi
-
-    # Call Ollama API with low temperature to reduce creativity/hallucination
-    RESULT=$(curl -s --max-time "$TIMEOUT" "$OLLAMA_URL" -d "$(jq -n \
-        --arg model "$OLLAMA_MODEL" \
-        --arg system "$SYSTEM_PROMPT" \
-        --arg text "$TEXT" \
-        '{
-            model: $model,
-            messages: [
-                {role: "system", content: $system},
-                {role: "user", content: $text}
-            ],
-            stream: false,
-            options: {
-                temperature: 0.1
-            }
-        }')" 2>/dev/null | jq -r '.message.content // empty')
-
-    # Check if result looks like a conversation (reject it, use original)
-    if echo "$RESULT" | grep -qiE "(It seems|How can I|I'd be happy|Hello|Hi there|I haven't|I don't have|This conversation|What would you|Can you provide|Could you|start of our|I cannot|I'm unable)"; then
-        echo "$TEXT"
-        exit 0
-    fi
-
-    if [ -n "$RESULT" ]; then
-        echo "$RESULT"
-        exit 0
-    fi
+# Find claude CLI
+CLAUDE_PATH="$HOME/.local/bin/claude"
+if [ ! -x "$CLAUDE_PATH" ]; then
+    CLAUDE_PATH=$(which claude 2>/dev/null || echo "")
 fi
 
-# Fallback: return original text
-echo "$TEXT"
+if [ -z "$CLAUDE_PATH" ] || [ ! -x "$CLAUDE_PATH" ]; then
+    echo "Error: Claude CLI not found" >&2
+    echo "$TEXT"
+    exit 0
+fi
+
+# Check instruction file exists
+if [ ! -f "$INSTRUCTION_FILE" ]; then
+    echo "Error: Instruction file not found: $INSTRUCTION_FILE" >&2
+    echo "$TEXT"
+    exit 0
+fi
+
+# Read instructions
+INSTRUCTIONS=$(cat "$INSTRUCTION_FILE")
+
+# Build full prompt
+FULL_PROMPT="${INSTRUCTIONS}
+
+## Transcription to format:
+
+${TEXT}"
+
+# Call Claude Haiku via Claude Code CLI
+# --output-format text returns raw text directly
+# --model haiku is fast and follows instructions well
+# --no-session-persistence avoids session overhead
+RESULT=$("$CLAUDE_PATH" -p "$FULL_PROMPT" \
+    --model haiku \
+    --output-format text \
+    --no-session-persistence \
+    2>/dev/null) || {
+    echo "Error: Claude CLI failed" >&2
+    echo "$TEXT"
+    exit 0
+}
+
+# Return result (or original text if empty)
+if [ -n "$RESULT" ]; then
+    echo "$RESULT"
+else
+    echo "$TEXT"
+fi
