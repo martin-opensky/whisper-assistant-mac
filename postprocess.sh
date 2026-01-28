@@ -55,6 +55,11 @@ RESULT=$("$CLAUDE_PATH" -p "$FULL_PROMPT" \
 
 # Return result (or original text if empty)
 if [ -n "$RESULT" ]; then
+    # Remove markdown code block wrappers (```markdown or ``` at start/end)
+    # Remove opening ``` or ```markdown line
+    RESULT=$(echo "$RESULT" | sed '1{/^```/d;}')
+    # Remove closing ``` line
+    RESULT=$(echo "$RESULT" | sed '${/^```$/d;}')
     echo "$RESULT"
 else
     echo "$TEXT"
