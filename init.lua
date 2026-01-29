@@ -442,365 +442,201 @@ local function stopRecording()
     -- Show persistent processing alert
     processingAlert = showAlert("⏸️ Transcribing...", "infinite")
 
-    -- Track the transcript directory for this recording (saved early for recovery)
-    local savedTranscriptDir = nil
-
-    -- IMMEDIATELY save recording before any delays (prevents data loss)
-    -- We do this synchronously before starting the timer
-    hs.timer.doAfter(0.3, function()
-        -- Quick check and save - this runs before the main timer
-        local ok, err = pcall(function()
-            if audioFile then
-                local file = io.open(audioFile, "r")
-                if file then
-                    local fileSize = file:seek("end")
-                    file:close()
-                    if fileSize >= 1000 then
-                        savedTranscriptDir = saveRecordingToTranscripts(audioFile)
-                        logToFile("Early save completed: " .. (savedTranscriptDir or "failed"))
-                    end
-                end
-            end
-        end)
-        if not ok then
-            logToFile("ERROR in early save: " .. tostring(err))
-        end
-    end)
+    -- Prepare transcript directory path for saving recording
+    local baseTranscriptDir = scriptDir .. "transcripts/"
+    local dateDir = os.date("%Y-%m-%d")
+    local timeDir = os.date("%H-%M-%S")
+    local transcriptDir = baseTranscriptDir .. dateDir .. "/" .. timeDir .. "/"
+    local savedTranscriptDir = transcriptDir
 
     -- Show chooser immediately (in parallel with transcription)
-    -- Chooser stays open during entire transcription - user can change selection anytime
-    -- When transcription completes, whatever is selected will be used automatically
     local choices = getPostProcessingChoices()
     local chooser = hs.chooser.new(function(choice)
         if choice then
-            -- User manually selected an option - update preference
             savePostProcessingPreference(choice.value)
-            print("Post-processing option changed to: " .. (choice.value or "None"))
         end
     end)
     chooser:choices(choices)
-    chooser:rows(math.min(#choices, 5))  -- Max 5 visible rows
-    chooser:searchSubText(true)  -- Allow searching by subtext
+    chooser:rows(math.min(#choices, 5))
+    chooser:searchSubText(true)
 
-    -- Pre-select last used option
-    local preselectedIndex = 1  -- Default to "None"
+    local preselectedIndex = 1
     if settings.postProcessing then
-        print("Looking for saved preference: " .. settings.postProcessing)
         for i, choice in ipairs(choices) do
             if choice.value == settings.postProcessing then
                 preselectedIndex = i
-                print("Pre-selecting row " .. i .. ": " .. choice.text)
                 break
             end
         end
     end
     chooser:show()
-
     chooser:selectedRow(preselectedIndex)
 
-    -- Start transcription (after giving early save a chance to complete)
-    hs.timer.doAfter(0.6, function()
-        -- Wrap entire callback in pcall to catch any errors
-        local ok, err = pcall(function()
-            logToFile("Timer callback started for transcription")
+    -- Use hs.task for EVERYTHING - hs.timer is unreliable when chooser is active
+    -- This task: 1) waits for ffmpeg to finish writing, 2) saves recording, 3) starts transcription
+    local saveAndTranscribeTask = hs.task.new(
+        "/bin/bash",
+        function(saveExitCode, saveStdOut, saveStdErr)
+            -- This callback is RELIABLE - it runs when the shell command completes
+            logToFile("Save task completed, exit code: " .. saveExitCode)
 
-            -- Check if audio file exists and has content
-            local file = io.open(audioFile, "r")
-            if not file then
-                chooser:hide()
-                if processingAlert then
-                    hs.alert.closeSpecific(processingAlert)
-                    processingAlert = nil
-                end
-                showAlert("❌ Audio file not created")
-                logToFile("Error: Audio file not found at " .. (audioFile or "nil"))
-                recordingTask = nil
-                isProcessing = false
-                return
+            if saveExitCode == 0 then
+                logToFile("Recording saved to: " .. transcriptDir .. "recording.wav")
+            else
+                logToFile("ERROR: Save failed: " .. saveStdErr)
             end
 
-            local fileSize = file:seek("end")
-            file:close()
-
-            if fileSize < 1000 then  -- Less than 1KB is probably empty/corrupted
-                chooser:hide()
-                if processingAlert then
-                    hs.alert.closeSpecific(processingAlert)
-                    processingAlert = nil
+            -- Now run transcription - wrap in pcall for safety
+            local ok, err = pcall(function()
+                -- Verify audio file
+                local file = io.open(audioFile, "r")
+                if not file then
+                    chooser:hide()
+                    if processingAlert then hs.alert.closeSpecific(processingAlert); processingAlert = nil end
+                    showAlert("❌ Audio file not found")
+                    logToFile("Error: Audio file not found at " .. (audioFile or "nil"))
+                    isProcessing = false
+                    return
                 end
-                showAlert("❌ Audio file too small")
-                logToFile("Error: Audio file size is only " .. fileSize .. " bytes")
-                os.remove(audioFile)
-                recordingTask = nil
-                isProcessing = false
-                return
-            end
+                local fileSize = file:seek("end")
+                file:close()
 
-            logToFile("Audio file verified: " .. fileSize .. " bytes")
-
-            -- Save recording if not already saved by early save
-            if not savedTranscriptDir then
-                savedTranscriptDir = saveRecordingToTranscripts(audioFile)
-            end
-
-        -- Load settings
-        local settings = loadSettings()
-        if not settings then
-            chooser:hide()
-            if processingAlert then
-                hs.alert.closeSpecific(processingAlert)
-                processingAlert = nil
-            end
-            os.remove(audioFile)
-            recordingTask = nil
-            isProcessing = false
-            return
-        end
-
-        -- Run transcription asynchronously using hs.task
-        -- Using whisper.cpp with Metal GPU acceleration for fast transcription
-        local transcribeScript = scriptDir .. "transcribe.sh"
-        local model = settings.model or "base.en"
-        local language = settings.language or "en"
-
-        logToFile("Running whisper.cpp transcription with model: " .. model)
-
-        -- Track start time for elapsed display
-        transcriptionStartTime = os.time()
-
-        -- Update alert with elapsed time every second
-        transcriptionProgressTimer = hs.timer.doEvery(1, function()
-            if transcriptionStartTime and processingAlert then
-                local elapsed = os.time() - transcriptionStartTime
-                hs.alert.closeSpecific(processingAlert)
-                processingAlert = showAlert(string.format("⏸️ Transcribing... %ds", elapsed), "infinite")
-            end
-        end)
-
-        transcriptionTask = hs.task.new(
-            "/bin/bash",
-            function(exitCode, stdOut, stdErr)
-                local elapsed = transcriptionStartTime and (os.time() - transcriptionStartTime) or 0
-                logToFile(string.format("Transcription completed in %ds, exit code: %d", elapsed, exitCode))
-
-                -- Cancel progress timer
-                if transcriptionProgressTimer then
-                    transcriptionProgressTimer:stop()
-                    transcriptionProgressTimer = nil
-                end
-                transcriptionStartTime = nil
-
-                -- Cancel timeout timer since transcription completed
-                if transcriptionTimeout then
-                    transcriptionTimeout:stop()
-                    transcriptionTimeout = nil
+                if fileSize < 1000 then
+                    chooser:hide()
+                    if processingAlert then hs.alert.closeSpecific(processingAlert); processingAlert = nil end
+                    showAlert("❌ Audio too small")
+                    logToFile("Error: Audio file size is only " .. fileSize .. " bytes")
+                    isProcessing = false
+                    return
                 end
 
-                -- Read currently selected option from chooser and close it
-                local selectedRow = chooser:selectedRow()
-                if selectedRow and selectedRow > 0 and selectedRow <= #choices then
-                    local selectedChoice = choices[selectedRow]
-                    selectedPostProcessing = selectedChoice.value
-                    savePostProcessingPreference(selectedChoice.value)
-                    logToFile("Using selected post-processing: " .. (selectedChoice.value or "None"))
-                end
-                chooser:hide()
+                logToFile("Audio verified: " .. fileSize .. " bytes, starting whisper")
 
-                -- Close persistent processing alert
-                if processingAlert then
-                    hs.alert.closeSpecific(processingAlert)
-                    processingAlert = nil
-                end
+                -- Get transcription settings
+                local transcribeScript = scriptDir .. "transcribe.sh"
+                local model = settings.model or "base.en"
+                local language = settings.language or "en"
 
-                -- Clean up audio file
-                os.remove(audioFile)
+                transcriptionStartTime = os.time()
 
-                if exitCode == 0 then
-                    local text = stdOut:gsub("^%s*(.-)%s*$", "%1") -- trim whitespace
-                    if text ~= "" then
-                        -- Check if post-processing is enabled (using selectedPostProcessing from chooser)
-                        if selectedPostProcessing then
-                            -- Show post-processing feedback
-                            if processingAlert then
-                                hs.alert.closeSpecific(processingAlert)
-                            end
-                            processingAlert = showAlert("⚙️ Processing: " .. selectedPostProcessing, "infinite")
+                -- Progress timer (this one is less critical)
+                transcriptionProgressTimer = hs.timer.doEvery(1, function()
+                    if transcriptionStartTime and processingAlert then
+                        local elapsed = os.time() - transcriptionStartTime
+                        hs.alert.closeSpecific(processingAlert)
+                        processingAlert = showAlert(string.format("⏸️ Transcribing... %ds", elapsed), "infinite")
+                    end
+                end)
 
-                            -- Run post-processing using faster shell script
-                            local postprocessScript = scriptDir .. "postprocess.sh"
-                            local instructionFile = scriptDir .. "instructions/" .. selectedPostProcessing .. ".md"
+                -- Run whisper transcription
+                transcriptionTask = hs.task.new(
+                    "/bin/bash",
+                    function(exitCode, stdOut, stdErr)
+                        local elapsed = transcriptionStartTime and (os.time() - transcriptionStartTime) or 0
+                        logToFile(string.format("Transcription completed in %ds, exit code: %d", elapsed, exitCode))
 
-                            logToFile("Running post-processing with: " .. selectedPostProcessing)
+                        if transcriptionProgressTimer then transcriptionProgressTimer:stop(); transcriptionProgressTimer = nil end
+                        transcriptionStartTime = nil
+                        if transcriptionTimeout then transcriptionTimeout:stop(); transcriptionTimeout = nil end
 
-                            local postprocessTask = hs.task.new(
-                                "/bin/bash",
-                                function(ppExitCode, ppStdOut, ppStdErr)
-                                    -- Close persistent processing alert
-                                    if processingAlert then
-                                        hs.alert.closeSpecific(processingAlert)
-                                        processingAlert = nil
-                                    end
+                        -- Get selected post-processing option
+                        local selectedRow = chooser:selectedRow()
+                        if selectedRow and selectedRow > 0 and selectedRow <= #choices then
+                            local selectedChoice = choices[selectedRow]
+                            selectedPostProcessing = selectedChoice.value
+                            savePostProcessingPreference(selectedChoice.value)
+                            logToFile("Using post-processing: " .. (selectedChoice.value or "None"))
+                        end
+                        chooser:hide()
 
-                                    local finalText = text  -- Default to original
-                                    local processedText = nil
+                        if processingAlert then hs.alert.closeSpecific(processingAlert); processingAlert = nil end
+                        os.remove(audioFile)
 
-                                    if ppExitCode == 0 then
-                                        processedText = ppStdOut:gsub("^%s*(.-)%s*$", "%1")
-                                        if processedText ~= "" then
-                                            finalText = processedText
-                                            logToFile("Post-processing successful: " .. #finalText .. " characters")
-                                        else
-                                            logToFile("Warning: Post-processing returned empty, using original")
-                                            processedText = nil  -- Clear if empty
-                                        end
-                                    else
-                                        logToFile("Post-processing error: " .. ppStdErr)
-                                        logToFile("Using original transcription")
-                                        processedText = nil  -- Clear on error
-                                    end
+                        if exitCode == 0 then
+                            local text = stdOut:gsub("^%s*(.-)%s*$", "%1")
+                            if text ~= "" then
+                                if selectedPostProcessing then
+                                    processingAlert = showAlert("⚙️ Processing: " .. selectedPostProcessing, "infinite")
+                                    local postprocessScript = scriptDir .. "postprocess.sh"
+                                    local instructionFile = scriptDir .. "instructions/" .. selectedPostProcessing .. ".md"
 
-                                    -- Save transcript (recording already saved earlier to same dir)
-                                    saveTranscript(text, processedText, selectedPostProcessing, savedTranscriptDir, nil)
+                                    local postprocessTask = hs.task.new(
+                                        "/bin/bash",
+                                        function(ppExitCode, ppStdOut, ppStdErr)
+                                            if processingAlert then hs.alert.closeSpecific(processingAlert); processingAlert = nil end
+                                            local finalText = text
+                                            local processedText = nil
 
-                                    -- Copy to clipboard
-                                    hs.pasteboard.setContents(finalText)
+                                            if ppExitCode == 0 then
+                                                processedText = ppStdOut:gsub("^%s*(.-)%s*$", "%1")
+                                                if processedText ~= "" then
+                                                    finalText = processedText
+                                                    logToFile("Post-processing successful: " .. #finalText .. " chars")
+                                                end
+                                            else
+                                                logToFile("Post-processing error: " .. ppStdErr)
+                                            end
 
-                                    -- Paste text at cursor
-                                    hs.eventtap.keyStrokes(finalText)
-                                    showAlert("✓ Transcribed & Processed")
-
-                                    recordingTask = nil
-                                    currentAudioFile = nil
-                                    transcriptionTask = nil
+                                            saveTranscript(text, processedText, selectedPostProcessing, savedTranscriptDir, nil)
+                                            hs.pasteboard.setContents(finalText)
+                                            hs.eventtap.keyStrokes(finalText)
+                                            showAlert("✓ Transcribed & Processed")
+                                            isProcessing = false
+                                        end,
+                                        {postprocessScript, text, instructionFile}
+                                    )
+                                    postprocessTask:start()
+                                else
+                                    saveTranscript(text, nil, nil, savedTranscriptDir, nil)
+                                    hs.pasteboard.setContents(text)
+                                    hs.eventtap.keyStrokes(text)
+                                    showAlert("✓ Transcribed & Copied")
+                                    logToFile("Transcription successful: " .. #text .. " chars")
                                     isProcessing = false
-                                end,
-                                {postprocessScript, text, instructionFile}
-                            )
-
-                            postprocessTask:start()
-                        else
-                            -- No post-processing, use original transcription
-                            -- Close persistent processing alert
-                            if processingAlert then
-                                hs.alert.closeSpecific(processingAlert)
-                                processingAlert = nil
+                                end
+                            else
+                                showAlert("⚠️ No speech detected")
+                                logToFile("Warning: Empty transcription")
+                                isProcessing = false
                             end
-
-                            -- Save transcript (recording already saved earlier to same dir)
-                            saveTranscript(text, nil, nil, savedTranscriptDir, nil)
-
-                            -- Copy to clipboard
-                            hs.pasteboard.setContents(text)
-
-                            -- Paste text at cursor
-                            hs.eventtap.keyStrokes(text)
-                            showAlert("✓ Transcribed & Copied")
-                            logToFile("Transcription successful: " .. #text .. " characters")
-
-                            recordingTask = nil
-                            currentAudioFile = nil
-                            transcriptionTask = nil
+                        else
+                            showAlert("❌ Transcription failed", 3)
+                            logToFile("Transcription error: " .. stdErr)
                             isProcessing = false
                         end
-                    else
-                        -- Close persistent processing alert
-                        if processingAlert then
-                            hs.alert.closeSpecific(processingAlert)
-                            processingAlert = nil
-                        end
+                    end,
+                    {transcribeScript, audioFile, model, language}
+                )
 
-                        showAlert("⚠️ No speech detected")
-                        logToFile("Warning: Transcription returned empty text")
+                transcriptionTask:start()
 
-                        recordingTask = nil
-                        currentAudioFile = nil
-                        transcriptionTask = nil
+                -- Timeout for hung transcriptions
+                transcriptionTimeout = hs.timer.doAfter(90, function()
+                    if transcriptionTask and transcriptionTask:isRunning() then
+                        logToFile("ERROR: Transcription timeout - recording saved at: " .. savedTranscriptDir)
+                        transcriptionTask:terminate()
+                        if transcriptionProgressTimer then transcriptionProgressTimer:stop() end
+                        if processingAlert then hs.alert.closeSpecific(processingAlert) end
+                        chooser:hide()
+                        showAlert("❌ Timeout\nRecording saved", 3)
                         isProcessing = false
                     end
-                else
-                    -- Close persistent processing alert
-                    if processingAlert then
-                        hs.alert.closeSpecific(processingAlert)
-                        processingAlert = nil
-                    end
+                end)
+            end)
 
-                    -- Parse error from stderr for user-friendly message
-                    local errorMsg = "Transcription failed"
-                    if stdErr:match("Model not found") then
-                        errorMsg = "Model not found - run: ollama pull llama3.2:3b"
-                    elseif stdErr:match("Audio file too small") then
-                        errorMsg = "Recording too short"
-                    elseif stdErr:match("empty result") then
-                        errorMsg = "No speech detected"
-                    elseif stdErr:match("whisper%-cli") then
-                        errorMsg = "Whisper error - check logs"
-                    end
-                    showAlert("❌ " .. errorMsg, 3)
-                    logToFile("Transcription error (stderr): " .. stdErr)
-
-                    recordingTask = nil
-                    currentAudioFile = nil
-                    transcriptionTask = nil
-                    isProcessing = false
-                end
-            end,
-            {transcribeScript, audioFile, model, language}
-        )
-
-        transcriptionTask:start()
-
-        -- Add timeout to prevent infinite hangs (90 seconds max for longer recordings)
-        transcriptionTimeout = hs.timer.doAfter(90, function()
-            if transcriptionTask and transcriptionTask:isRunning() then
-                logToFile("ERROR: Transcription timeout after 90 seconds - terminating task")
-                if savedTranscriptDir then
-                    logToFile("Recording preserved at: " .. savedTranscriptDir .. "recording.wav")
-                end
-                transcriptionTask:terminate()
-
-                -- Cancel progress timer
-                if transcriptionProgressTimer then
-                    transcriptionProgressTimer:stop()
-                    transcriptionProgressTimer = nil
-                end
-                transcriptionStartTime = nil
-
-                -- Close alerts and chooser
-                if processingAlert then
-                    hs.alert.closeSpecific(processingAlert)
-                    processingAlert = nil
-                end
+            if not ok then
+                logToFile("CRITICAL ERROR: " .. tostring(err))
                 chooser:hide()
-
-                -- Clean up temp file only (recording already saved to transcripts)
-                if audioFile and hs.fs.attributes(audioFile) then
-                    os.remove(audioFile)
-                end
-
-                showAlert("❌ Transcription timed out\nRecording saved", 3)
-                recordingTask = nil
-                currentAudioFile = nil
-                transcriptionTask = nil
+                if processingAlert then hs.alert.closeSpecific(processingAlert); processingAlert = nil end
+                showAlert("❌ Error - check logs", 3)
                 isProcessing = false
             end
-        end)
-        end) -- end pcall function
+        end,
+        {"-c", string.format('sleep 0.5 && mkdir -p "%s" && cp "%s" "%s"', transcriptDir, audioFile, transcriptDir .. "recording.wav")}
+    )
 
-        -- Handle pcall error
-        if not ok then
-            logToFile("CRITICAL ERROR in timer callback: " .. tostring(err))
-            chooser:hide()
-            if processingAlert then
-                hs.alert.closeSpecific(processingAlert)
-                processingAlert = nil
-            end
-            showAlert("❌ Internal error\nCheck logs", 3)
-            recordingTask = nil
-            currentAudioFile = nil
-            transcriptionTask = nil
-            isProcessing = false
-        end
-    end)
+    saveAndTranscribeTask:start()
+    logToFile("Save task started")
 end
 
 -- Toggle recording
