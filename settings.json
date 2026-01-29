@@ -1,6 +1,6 @@
 {
-  "audioDevice" : ":1",
   "language" : "en",
+  "audioDevice" : ":1",
   "model" : "base.en",
   "hotkey" : {
     "key" : "m",

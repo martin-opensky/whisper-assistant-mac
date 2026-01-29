@@ -13,6 +13,9 @@ __pycache__/
 /transcripts/*
 !/transcripts/.gitkeep
 
+# Log files
+whisper-assistant.log
+
 # macOS
 .DS_Store
 .AppleDouble

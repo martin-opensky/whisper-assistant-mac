@@ -20,6 +20,20 @@ local scriptDir = debug.getinfo(1, "S").source:match("@(.*/)")
 local savedVolume = nil
 local fadeTimer = nil
 
+-- Log file path for persistent error logging
+local logFile = scriptDir .. "whisper-assistant.log"
+
+-- Helper function to write to persistent log file
+local function logToFile(message)
+    local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+    local file = io.open(logFile, "a")
+    if file then
+        file:write(timestamp .. ": " .. message .. "\n")
+        file:close()
+    end
+    print(message)  -- Also print to Hammerspoon console
+end
+
 -- Cleanup function to terminate any existing tasks and reset state
 local function cleanup()
     if recordingTask then recordingTask:terminate() end
@@ -164,9 +178,9 @@ local function savePostProcessingPreference(selection)
         local success, encoded = pcall(hs.json.encode, settings, true)
         if success then
             file:write(encoded)
-            print("Saved postProcessing preference: " .. (selection or "None"))
+            logToFile("Saved postProcessing preference: " .. (selection or "None"))
         else
-            print("Error encoding settings: " .. tostring(encoded))
+            logToFile("Error encoding settings: " .. tostring(encoded))
         end
         file:close()
     else
@@ -190,27 +204,35 @@ local function getTimeDir()
 end
 
 -- Helper function to clean up old transcripts (older than 7 days)
+-- Also cleans up recordings older than 1 day
 local function cleanupOldTranscripts()
     local transcriptDir = scriptDir .. "transcripts/"
     local maxAgeDays = 7
+    local recordingMaxAgeDays = 1  -- Keep recordings for 1 day only
 
     -- Use hs.task for non-blocking cleanup
     hs.task.new(
         "/bin/bash",
         function(exitCode, stdOut, stdErr)
             if exitCode == 0 then
-                local deletedCount = tonumber(stdOut:match("(%d+)")) or 0
-                if deletedCount > 0 then
-                    print("Cleanup: Removed " .. deletedCount .. " old transcript(s)")
+                local transcriptCount = tonumber(stdOut:match("transcripts:(%d+)")) or 0
+                local recordingCount = tonumber(stdOut:match("recordings:(%d+)")) or 0
+                if transcriptCount > 0 then
+                    logToFile("Cleanup: Removed " .. transcriptCount .. " old transcript(s)")
+                end
+                if recordingCount > 0 then
+                    logToFile("Cleanup: Removed " .. recordingCount .. " old recording(s)")
                 end
             else
-                print("Cleanup error: " .. stdErr)
+                logToFile("Cleanup error: " .. stdErr)
             end
         end,
         {"-c", string.format([[
-            count=0
+            transcript_count=0
+            recording_count=0
             transcript_dir="%s"
             max_age_days=%d
+            recording_max_age_days=%d
 
             # Find and delete transcript directories older than max_age_days
             for date_dir in "$transcript_dir"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
@@ -222,7 +244,16 @@ local function cleanupOldTranscripts()
                     # Check if directory is older than max_age_days
                     if [ $(find "$time_dir" -maxdepth 0 -mtime +$max_age_days 2>/dev/null | wc -l) -gt 0 ]; then
                         rm -rf "$time_dir"
-                        ((count++))
+                        ((transcript_count++))
+                    else
+                        # For directories not being deleted, check for old recordings (older than 1 day)
+                        for wav_file in "$time_dir"/*.wav; do
+                            [ -f "$wav_file" ] || continue
+                            if [ $(find "$wav_file" -mtime +$recording_max_age_days 2>/dev/null | wc -l) -gt 0 ]; then
+                                rm -f "$wav_file"
+                                ((recording_count++))
+                            fi
+                        done
                     fi
                 done
 
@@ -230,26 +261,35 @@ local function cleanupOldTranscripts()
                 rmdir "$date_dir" 2>/dev/null
             done
 
-            echo "$count"
-        ]], transcriptDir, maxAgeDays)}
+            echo "transcripts:$transcript_count recordings:$recording_count"
+        ]], transcriptDir, maxAgeDays, recordingMaxAgeDays)}
     ):start()
 end
 
--- Helper function to save transcript
-local function saveTranscript(originalText, processedText, processingType)
-    local baseTranscriptDir = scriptDir .. "transcripts/"
-    local dateDir = getDateDir()
-    local timeDir = getTimeDir()
-    local transcriptDir = baseTranscriptDir .. dateDir .. "/" .. timeDir .. "/"
+-- Helper function to save transcript and recording
+-- existingDir: optional path to existing transcript directory (to ensure recording and transcript are in same dir)
+-- audioFile: path to the source audio file (will be copied, not moved)
+local function saveTranscript(originalText, processedText, processingType, existingDir, audioFile)
+    local transcriptDir
+    if existingDir then
+        transcriptDir = existingDir
+    else
+        local baseTranscriptDir = scriptDir .. "transcripts/"
+        local dateDir = getDateDir()
+        local timeDir = getTimeDir()
+        transcriptDir = baseTranscriptDir .. dateDir .. "/" .. timeDir .. "/"
+    end
 
-    -- Create nested directory structure
+    -- Create nested directory structure (may already exist if recording was saved)
     os.execute("mkdir -p " .. transcriptDir)
 
     -- Save original transcript (content only)
-    local originalFile = io.open(transcriptDir .. "transcript.md", "w")
-    if originalFile then
-        originalFile:write(originalText)
-        originalFile:close()
+    if originalText then
+        local originalFile = io.open(transcriptDir .. "transcript.md", "w")
+        if originalFile then
+            originalFile:write(originalText)
+            originalFile:close()
+        end
     end
 
     -- Save post-processed transcript to separate file if exists
@@ -261,7 +301,19 @@ local function saveTranscript(originalText, processedText, processingType)
         end
     end
 
-    print("Transcript saved to: " .. transcriptDir)
+    -- Copy audio file to transcript directory for recovery
+    if audioFile then
+        local destAudioFile = transcriptDir .. "recording.wav"
+        local copyResult = os.execute(string.format('cp "%s" "%s"', audioFile, destAudioFile))
+        if copyResult then
+            logToFile("Recording saved to: " .. destAudioFile)
+        else
+            logToFile("Warning: Failed to copy recording to " .. destAudioFile)
+        end
+    end
+
+    logToFile("Transcript saved to: " .. transcriptDir)
+    return transcriptDir
 end
 
 -- Start recording
@@ -304,10 +356,10 @@ local function startRecording()
     recordingTask = hs.task.new(
         "/bin/bash",
         function(exitCode, stdOut, stdErr)
-            print("FFmpeg exit code: " .. exitCode)
-            if exitCode ~= 0 then
-                print("FFmpeg output: " .. stdOut)
-                print("FFmpeg error: " .. stdErr)
+            logToFile("FFmpeg exit code: " .. exitCode)
+            if exitCode ~= 0 and exitCode ~= 255 then  -- 255 is normal termination
+                logToFile("FFmpeg output: " .. stdOut)
+                logToFile("FFmpeg error: " .. stdErr)
             end
         end,
         {"-c", ffmpegCmd}
@@ -323,6 +375,30 @@ local function startRecording()
     recordingAlert = showAlert("🎤 Recording...", "infinite")
 end
 
+-- Helper function to save recording to transcripts directory (returns saved path)
+local function saveRecordingToTranscripts(audioFile)
+    if not audioFile then return nil end
+
+    local baseTranscriptDir = scriptDir .. "transcripts/"
+    local dateDir = getDateDir()
+    local timeDir = getTimeDir()
+    local transcriptDir = baseTranscriptDir .. dateDir .. "/" .. timeDir .. "/"
+
+    -- Create nested directory structure
+    os.execute("mkdir -p " .. transcriptDir)
+
+    -- Copy audio file immediately
+    local destAudioFile = transcriptDir .. "recording.wav"
+    local copyResult = os.execute(string.format('cp "%s" "%s"', audioFile, destAudioFile))
+    if copyResult then
+        logToFile("Recording saved immediately to: " .. destAudioFile)
+        return transcriptDir
+    else
+        logToFile("ERROR: Failed to save recording to " .. destAudioFile)
+        return nil
+    end
+end
+
 -- Stop recording and transcribe
 local function stopRecording()
     if not recordingTask then
@@ -332,6 +408,7 @@ local function stopRecording()
     -- Stop recording
     recordingTask:terminate()
     local audioFile = currentAudioFile
+    logToFile("Recording stopped, audio file: " .. (audioFile or "nil"))
 
     -- Fade volume back in to saved level
     if savedVolume and savedVolume > 0 then
@@ -365,6 +442,31 @@ local function stopRecording()
     -- Show persistent processing alert
     processingAlert = showAlert("⏸️ Transcribing...", "infinite")
 
+    -- Track the transcript directory for this recording (saved early for recovery)
+    local savedTranscriptDir = nil
+
+    -- IMMEDIATELY save recording before any delays (prevents data loss)
+    -- We do this synchronously before starting the timer
+    hs.timer.doAfter(0.3, function()
+        -- Quick check and save - this runs before the main timer
+        local ok, err = pcall(function()
+            if audioFile then
+                local file = io.open(audioFile, "r")
+                if file then
+                    local fileSize = file:seek("end")
+                    file:close()
+                    if fileSize >= 1000 then
+                        savedTranscriptDir = saveRecordingToTranscripts(audioFile)
+                        logToFile("Early save completed: " .. (savedTranscriptDir or "failed"))
+                    end
+                end
+            end
+        end)
+        if not ok then
+            logToFile("ERROR in early save: " .. tostring(err))
+        end
+    end)
+
     -- Show chooser immediately (in parallel with transcription)
     -- Chooser stays open during entire transcription - user can change selection anytime
     -- When transcription completes, whatever is selected will be used automatically
@@ -396,41 +498,50 @@ local function stopRecording()
 
     chooser:selectedRow(preselectedIndex)
 
-    -- Start transcription immediately (in parallel with chooser)
-    hs.timer.doAfter(0.5, function()
-        -- Check if audio file exists and has content
-        local file = io.open(audioFile, "r")
-        if not file then
-            chooser:hide()
-            if processingAlert then
-                hs.alert.closeSpecific(processingAlert)
-                processingAlert = nil
+    -- Start transcription (after giving early save a chance to complete)
+    hs.timer.doAfter(0.6, function()
+        -- Wrap entire callback in pcall to catch any errors
+        local ok, err = pcall(function()
+            logToFile("Timer callback started for transcription")
+
+            -- Check if audio file exists and has content
+            local file = io.open(audioFile, "r")
+            if not file then
+                chooser:hide()
+                if processingAlert then
+                    hs.alert.closeSpecific(processingAlert)
+                    processingAlert = nil
+                end
+                showAlert("❌ Audio file not created")
+                logToFile("Error: Audio file not found at " .. (audioFile or "nil"))
+                recordingTask = nil
+                isProcessing = false
+                return
             end
-            showAlert("❌ Audio file not created")
-            print("Error: Audio file not found at " .. audioFile)
-            recordingTask = nil
-            isProcessing = false
-            return
-        end
 
-        local fileSize = file:seek("end")
-        file:close()
+            local fileSize = file:seek("end")
+            file:close()
 
-        if fileSize < 1000 then  -- Less than 1KB is probably empty/corrupted
-            chooser:hide()
-            if processingAlert then
-                hs.alert.closeSpecific(processingAlert)
-                processingAlert = nil
+            if fileSize < 1000 then  -- Less than 1KB is probably empty/corrupted
+                chooser:hide()
+                if processingAlert then
+                    hs.alert.closeSpecific(processingAlert)
+                    processingAlert = nil
+                end
+                showAlert("❌ Audio file too small")
+                logToFile("Error: Audio file size is only " .. fileSize .. " bytes")
+                os.remove(audioFile)
+                recordingTask = nil
+                isProcessing = false
+                return
             end
-            showAlert("❌ Audio file too small")
-            print("Error: Audio file size is only " .. fileSize .. " bytes")
-            os.remove(audioFile)
-            recordingTask = nil
-            isProcessing = false
-            return
-        end
 
-        print("Audio file created successfully: " .. fileSize .. " bytes")
+            logToFile("Audio file verified: " .. fileSize .. " bytes")
+
+            -- Save recording if not already saved by early save
+            if not savedTranscriptDir then
+                savedTranscriptDir = saveRecordingToTranscripts(audioFile)
+            end
 
         -- Load settings
         local settings = loadSettings()
@@ -452,7 +563,7 @@ local function stopRecording()
         local model = settings.model or "base.en"
         local language = settings.language or "en"
 
-        print("Running whisper.cpp transcription with model: " .. model)
+        logToFile("Running whisper.cpp transcription with model: " .. model)
 
         -- Track start time for elapsed display
         transcriptionStartTime = os.time()
@@ -470,7 +581,7 @@ local function stopRecording()
             "/bin/bash",
             function(exitCode, stdOut, stdErr)
                 local elapsed = transcriptionStartTime and (os.time() - transcriptionStartTime) or 0
-                print(string.format("Transcription completed in %ds, exit code: %d", elapsed, exitCode))
+                logToFile(string.format("Transcription completed in %ds, exit code: %d", elapsed, exitCode))
 
                 -- Cancel progress timer
                 if transcriptionProgressTimer then
@@ -491,7 +602,7 @@ local function stopRecording()
                     local selectedChoice = choices[selectedRow]
                     selectedPostProcessing = selectedChoice.value
                     savePostProcessingPreference(selectedChoice.value)
-                    print("Using selected post-processing: " .. (selectedChoice.value or "None"))
+                    logToFile("Using selected post-processing: " .. (selectedChoice.value or "None"))
                 end
                 chooser:hide()
 
@@ -519,7 +630,7 @@ local function stopRecording()
                             local postprocessScript = scriptDir .. "postprocess.sh"
                             local instructionFile = scriptDir .. "instructions/" .. selectedPostProcessing .. ".md"
 
-                            print("Running post-processing with: " .. selectedPostProcessing)
+                            logToFile("Running post-processing with: " .. selectedPostProcessing)
 
                             local postprocessTask = hs.task.new(
                                 "/bin/bash",
@@ -537,19 +648,19 @@ local function stopRecording()
                                         processedText = ppStdOut:gsub("^%s*(.-)%s*$", "%1")
                                         if processedText ~= "" then
                                             finalText = processedText
-                                            print("Post-processing successful: " .. #finalText .. " characters")
+                                            logToFile("Post-processing successful: " .. #finalText .. " characters")
                                         else
-                                            print("Warning: Post-processing returned empty, using original")
+                                            logToFile("Warning: Post-processing returned empty, using original")
                                             processedText = nil  -- Clear if empty
                                         end
                                     else
-                                        print("Post-processing error: " .. ppStdErr)
-                                        print("Using original transcription")
+                                        logToFile("Post-processing error: " .. ppStdErr)
+                                        logToFile("Using original transcription")
                                         processedText = nil  -- Clear on error
                                     end
 
-                                    -- Save transcript with both original and processed versions
-                                    saveTranscript(text, processedText, selectedPostProcessing)
+                                    -- Save transcript (recording already saved earlier to same dir)
+                                    saveTranscript(text, processedText, selectedPostProcessing, savedTranscriptDir, nil)
 
                                     -- Copy to clipboard
                                     hs.pasteboard.setContents(finalText)
@@ -575,8 +686,8 @@ local function stopRecording()
                                 processingAlert = nil
                             end
 
-                            -- Save transcript (original only, no post-processing)
-                            saveTranscript(text, nil, nil)
+                            -- Save transcript (recording already saved earlier to same dir)
+                            saveTranscript(text, nil, nil, savedTranscriptDir, nil)
 
                             -- Copy to clipboard
                             hs.pasteboard.setContents(text)
@@ -584,7 +695,7 @@ local function stopRecording()
                             -- Paste text at cursor
                             hs.eventtap.keyStrokes(text)
                             showAlert("✓ Transcribed & Copied")
-                            print("Transcription successful: " .. #text .. " characters")
+                            logToFile("Transcription successful: " .. #text .. " characters")
 
                             recordingTask = nil
                             currentAudioFile = nil
@@ -599,7 +710,7 @@ local function stopRecording()
                         end
 
                         showAlert("⚠️ No speech detected")
-                        print("Warning: Transcription returned empty text")
+                        logToFile("Warning: Transcription returned empty text")
 
                         recordingTask = nil
                         currentAudioFile = nil
@@ -625,7 +736,7 @@ local function stopRecording()
                         errorMsg = "Whisper error - check logs"
                     end
                     showAlert("❌ " .. errorMsg, 3)
-                    print("Transcription error (stderr): " .. stdErr)
+                    logToFile("Transcription error (stderr): " .. stdErr)
 
                     recordingTask = nil
                     currentAudioFile = nil
@@ -641,7 +752,10 @@ local function stopRecording()
         -- Add timeout to prevent infinite hangs (90 seconds max for longer recordings)
         transcriptionTimeout = hs.timer.doAfter(90, function()
             if transcriptionTask and transcriptionTask:isRunning() then
-                print("Transcription timeout after 90 seconds - terminating task")
+                logToFile("ERROR: Transcription timeout after 90 seconds - terminating task")
+                if savedTranscriptDir then
+                    logToFile("Recording preserved at: " .. savedTranscriptDir .. "recording.wav")
+                end
                 transcriptionTask:terminate()
 
                 -- Cancel progress timer
@@ -658,18 +772,34 @@ local function stopRecording()
                 end
                 chooser:hide()
 
-                -- Clean up
+                -- Clean up temp file only (recording already saved to transcripts)
                 if audioFile and hs.fs.attributes(audioFile) then
                     os.remove(audioFile)
                 end
 
-                showAlert("❌ Transcription timed out", 3)
+                showAlert("❌ Transcription timed out\nRecording saved", 3)
                 recordingTask = nil
                 currentAudioFile = nil
                 transcriptionTask = nil
                 isProcessing = false
             end
         end)
+        end) -- end pcall function
+
+        -- Handle pcall error
+        if not ok then
+            logToFile("CRITICAL ERROR in timer callback: " .. tostring(err))
+            chooser:hide()
+            if processingAlert then
+                hs.alert.closeSpecific(processingAlert)
+                processingAlert = nil
+            end
+            showAlert("❌ Internal error\nCheck logs", 3)
+            recordingTask = nil
+            currentAudioFile = nil
+            transcriptionTask = nil
+            isProcessing = false
+        end
     end)
 end
 

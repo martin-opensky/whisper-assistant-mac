@@ -35,7 +35,13 @@ Paste to cursor + save transcript
 # Download whisper model
 curl -L "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" -o models/ggml-base.en.bin
 
-# Test transcription manually
+# Re-transcribe a recording (interactive - lists today's recordings)
+./transcribe.sh
+
+# List today's recordings
+./transcribe.sh --list
+
+# Direct transcription of specific file
 ./transcribe.sh /path/to/audio.wav base.en en
 
 # Test post-processing manually
@@ -68,6 +74,37 @@ ollama pull llama3.2:3b
 1. Create `instructions/yourtemplate.md` with formatting rules
 2. Set `"postProcessing": "yourtemplate"` in settings.json
 3. The instruction file content is passed as the system prompt to Ollama
+
+## Troubleshooting & Recovery
+
+**Log files:**
+- `whisper-assistant.log` - Main application log (in script directory / ~/.hammerspoon/)
+- `/tmp/whisper-transcribe.log` - Whisper transcription details
+
+**Check logs:**
+```bash
+# Watch main log in real-time
+tail -f ~/.hammerspoon/whisper-assistant.log
+
+# Check whisper-specific logs
+tail -f /tmp/whisper-transcribe.log
+```
+
+**Recordings are automatically saved** to `transcripts/YYYY-MM-DD/HH-MM-SS/recording.wav` immediately when recording stops. Even if transcription fails or times out, the recording is preserved.
+
+**Re-transcribe a failed recording:**
+```bash
+# Interactive mode - select from today's recordings
+./transcribe.sh
+
+# List today's recordings without transcribing
+./transcribe.sh --list
+
+# Direct transcription of specific file
+./transcribe.sh /path/to/recording.wav base.en en
+```
+
+**Recording cleanup:** Recordings older than 1 day are automatically deleted. Transcripts are kept for 7 days.
 
 ## Dependencies
 

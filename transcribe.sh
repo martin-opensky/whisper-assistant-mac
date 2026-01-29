@@ -2,17 +2,128 @@
 #
 # Transcribe audio using whisper.cpp with Metal GPU acceleration
 #
-# Usage: transcribe.sh <audio_file> [model_size] [language]
+# Usage:
+#   transcribe.sh                        # Interactive mode - select from today's recordings
+#   transcribe.sh --list                 # List today's recordings
+#   transcribe.sh <audio_file> [model] [language]  # Direct transcription
 #
 # Model sizes: tiny, base, small, medium, large (default: base)
 # For English-only, use: tiny.en, base.en, small.en, medium.en
 #
 
-AUDIO_FILE="$1"
-MODEL_SIZE="${2:-base.en}"
-LANGUAGE="${3:-en}"
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TRANSCRIPTS_DIR="$SCRIPT_DIR/transcripts"
+TODAY=$(date +%Y-%m-%d)
+
+# Function to list today's recordings (display only, most recent first)
+list_recordings() {
+    local today_dir="$TRANSCRIPTS_DIR/$TODAY"
+    if [ ! -d "$today_dir" ]; then
+        echo "No recordings found for today ($TODAY)"
+        return 1
+    fi
+
+    local count=0
+    local i=1
+
+    echo ""
+    echo "Today's recordings ($TODAY) - most recent first:"
+    echo "-------------------------------------------------"
+
+    # Get directories sorted by name in reverse order (most recent first)
+    for time_dir in $(ls -1dr "$today_dir"/*/  2>/dev/null); do
+        [ -d "$time_dir" ] || continue
+        local wav_file="$time_dir/recording.wav"
+        if [ -f "$wav_file" ]; then
+            local time_name=$(basename "$time_dir")
+            local size=$(stat -f%z "$wav_file" 2>/dev/null || stat -c%s "$wav_file" 2>/dev/null)
+            local size_kb=$((size / 1024))
+            local has_transcript=""
+            [ -f "$time_dir/transcript.md" ] && has_transcript=" [transcribed]"
+            echo "  $i) $time_name - ${size_kb}KB${has_transcript}"
+            ((i++))
+            ((count++))
+        fi
+    done
+
+    if [ $count -eq 0 ]; then
+        echo "  No recordings found"
+        return 1
+    fi
+
+    echo ""
+}
+
+# Function for interactive selection (most recent first)
+interactive_select() {
+    local today_dir="$TRANSCRIPTS_DIR/$TODAY"
+    if [ ! -d "$today_dir" ]; then
+        echo "No recordings found for today ($TODAY)"
+        exit 1
+    fi
+
+    local recordings=()
+    local i=1
+
+    echo ""
+    echo "Today's recordings ($TODAY) - most recent first:"
+    echo "-------------------------------------------------"
+
+    # Get directories sorted by name in reverse order (most recent first)
+    for time_dir in $(ls -1dr "$today_dir"/*/  2>/dev/null); do
+        [ -d "$time_dir" ] || continue
+        local wav_file="$time_dir/recording.wav"
+        if [ -f "$wav_file" ]; then
+            local time_name=$(basename "$time_dir")
+            local size=$(stat -f%z "$wav_file" 2>/dev/null || stat -c%s "$wav_file" 2>/dev/null)
+            local size_kb=$((size / 1024))
+            local has_transcript=""
+            [ -f "$time_dir/transcript.md" ] && has_transcript=" [transcribed]"
+            echo "  $i) $time_name - ${size_kb}KB${has_transcript}"
+            recordings+=("$wav_file")
+            ((i++))
+        fi
+    done
+
+    if [ ${#recordings[@]} -eq 0 ]; then
+        echo "No recordings found for today"
+        exit 1
+    fi
+
+    echo ""
+    read -p "Select recording (1-${#recordings[@]}): " selection
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt ${#recordings[@]} ]; then
+        echo "Invalid selection"
+        exit 1
+    fi
+
+    AUDIO_FILE="${recordings[$((selection-1))]}"
+    echo ""
+    echo "Selected: $AUDIO_FILE"
+    echo ""
+}
+
+# Handle --list flag
+if [ "$1" = "--list" ]; then
+    list_recordings
+    exit 0
+fi
+
+# Track if we're in interactive mode (to save transcript and copy to clipboard)
+INTERACTIVE_MODE=false
+
+# Interactive mode if no arguments
+if [ -z "$1" ]; then
+    interactive_select
+    INTERACTIVE_MODE=true
+    MODEL_SIZE="base.en"
+    LANGUAGE="en"
+else
+    AUDIO_FILE="$1"
+    MODEL_SIZE="${2:-base.en}"
+    LANGUAGE="${3:-en}"
+fi
 MODELS_DIR="$SCRIPT_DIR/models"
 WHISPER_CLI="/opt/homebrew/bin/whisper-cli"
 LOG_FILE="/tmp/whisper-transcribe.log"
@@ -122,3 +233,20 @@ rm -f "$TEMP_ERR"
 CHAR_COUNT=${#RESULT}
 log "Transcription complete: ${DURATION}s, ${CHAR_COUNT} chars"
 echo "$RESULT"
+
+# In interactive mode: save transcript and copy to clipboard
+if [ "$INTERACTIVE_MODE" = true ]; then
+    # Get the directory containing the recording
+    RECORDING_DIR=$(dirname "$AUDIO_FILE")
+    TRANSCRIPT_FILE="$RECORDING_DIR/transcript.md"
+
+    # Save transcript
+    echo "$RESULT" > "$TRANSCRIPT_FILE"
+    log "Transcript saved to: $TRANSCRIPT_FILE"
+    echo ""
+    echo "[Saved to: $TRANSCRIPT_FILE]"
+
+    # Copy to clipboard (macOS)
+    echo "$RESULT" | pbcopy
+    echo "[Copied to clipboard]"
+fi
