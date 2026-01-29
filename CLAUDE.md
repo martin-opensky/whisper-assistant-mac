@@ -2,6 +2,42 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Current Status (2026-01-29)
+
+**What was done:**
+- Fixed critical bug where recordings were lost when transcription failed silently
+- Root cause: `hs.timer.doAfter` is unreliable when Hammerspoon's chooser UI is active
+- Solution: Replaced timers with `hs.task` running shell commands (`sleep 0.5 && mkdir && cp`)
+- Task callbacks are reliable regardless of UI state
+- Recordings now saved BEFORE transcription starts (prevents data loss)
+- Added persistent logging to `whisper-assistant.log`
+- Enhanced `transcribe.sh` with interactive mode (most recent recordings shown first)
+- Transcripts saved alongside recordings, copied to clipboard
+
+**The fix that worked:** In `stopRecording()`, instead of using `hs.timer.doAfter(0.5, ...)` which silently fails when the chooser is open, we now use:
+```lua
+hs.task.new("/bin/bash", callback, {"-c", "sleep 0.5 && mkdir -p DIR && cp FILE DIR"})
+```
+
+**Testing status:** User reported no errors since the fix was applied. Needs continued monitoring over several days to confirm stability.
+
+## Next Steps
+
+1. **Monitor for stability** - Use the tool normally and watch for any recurrence of the silent failure issue
+2. **Performance optimization** - Consider if the 0.5s sleep delay can be reduced
+3. **Potential improvements:**
+   - Add notification sound on transcription complete
+   - Support for multiple whisper models via settings
+   - Batch re-transcription of failed recordings
+
+## Key Files to Reference
+
+When continuing work on this project, read these files:
+- `init.lua` - Main orchestrator (~677 lines) - the `stopRecording()` function (around line 403) contains the critical fix
+- `transcribe.sh` - CLI tool for manual/recovery transcription
+- `settings.json` - User configuration
+- `whisper-assistant.log` - Check this for debugging issues
+
 ## Project Overview
 
 Whisper Assistant is a macOS voice transcription tool that records audio via hotkey (CMD+M), transcribes using whisper.cpp with Metal GPU acceleration, optionally formats via Ollama, and pastes the result at the cursor.
@@ -58,10 +94,17 @@ ollama pull llama3.2:3b
 ## Key Implementation Details
 
 **Transcription flow in init.lua:**
-1. `startRecording()` - Spawns ffmpeg via `hs.task`, shows menu bar indicator
-2. `stopRecording()` - Terminates ffmpeg, validates audio file size, spawns transcribe.sh
-3. Transcription callback - Parses result, optionally spawns postprocess.sh
-4. Final callback - Saves transcript, copies to clipboard, pastes via `hs.eventtap.keyStrokes()`
+1. `startRecording()` - Spawns ffmpeg via `hs.task`, shows menu bar indicator, fades volume out
+2. `stopRecording()` - Terminates ffmpeg, shows chooser UI, starts `saveAndTranscribeTask`
+3. `saveAndTranscribeTask` (hs.task) - Shell command: `sleep 0.5 && mkdir -p && cp` saves recording
+4. Task callback - Verifies audio file, spawns whisper transcription via `transcribe.sh`
+5. Transcription callback - Parses result, optionally spawns `postprocess.sh` for Ollama formatting
+6. Final callback - Saves transcript, copies to clipboard, pastes via `hs.eventtap.keyStrokes()`
+
+**CRITICAL: Why hs.task instead of hs.timer:**
+- `hs.timer.doAfter()` silently fails when Hammerspoon's chooser UI is active
+- `hs.task` callbacks are reliable regardless of UI state
+- All critical operations (save, transcribe) now use `hs.task`
 
 **Timeout handling:** 90-second timeout kills hung transcriptions. Progress timer updates alert with elapsed time.
 
