@@ -1,7 +1,7 @@
 {
   "audioDevice" : ":1",
   "language" : "en",
-  "model" : "base.en",
+  "model" : "large-v3-turbo-q5_0",
   "hotkey" : {
     "key" : "m",
     "modifiers" : [

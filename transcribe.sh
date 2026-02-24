@@ -151,6 +151,12 @@ case "$MODEL_SIZE" in
     large|large-v3)
         MODEL_FILE="ggml-large-v3.bin"
         ;;
+    large-v3-turbo|turbo)
+        MODEL_FILE="ggml-large-v3-turbo.bin"
+        ;;
+    large-v3-turbo-q5_0|turbo-q5_0)
+        MODEL_FILE="ggml-large-v3-turbo-q5_0.bin"
+        ;;
     *)
         MODEL_FILE="$MODEL_SIZE"
         ;;
@@ -198,7 +204,7 @@ RESULT=$("$WHISPER_CLI" \
     -m "$MODEL_PATH" \
     -f "$AUDIO_FILE" \
     -l "$LANGUAGE" \
-    -t 4 \
+    -t 8 \
     --no-prints \
     --no-timestamps \
     2>"$TEMP_ERR")
